@@ -1,0 +1,231 @@
+name: Video Processing Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      videoId:
+        description: 'Video ID to process'
+        required: true
+      bucket:
+        description: 'S3 bucket name'
+        required: true
+      sourceKey:
+        description: 'Source S3 key'
+        required: true
+
+jobs:
+  process_video:
+    runs-on: ubuntu-latest
+    
+    steps:
+    # Step 1: Checkout code
+    - name: Checkout code
+      uses: actions/checkout@v3
+    
+    # Step 2: Install FFmpeg
+    - name: Install FFmpeg
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y ffmpeg
+    
+    # Step 3: Setup AWS credentials
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: us-east-1
+    
+    # Step 4: Download source video
+    - name: Download source video
+      run: |
+        aws s3 cp s3://${{ inputs.bucket }}/${{ inputs.sourceKey }} input.mp4
+        echo "Source downloaded"
+    
+    # Step 5: Detect video quality
+    - name: Detect video quality
+      id: detect
+      run: |
+        # Get input video properties
+        DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1:novalue=1 input.mp4 | head -c 5)
+        WIDTH=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of default=noprint_wrappers=1:nokey=1:novalue=1 input.mp4)
+        HEIGHT=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of default=noprint_wrappers=1:nokey=1:novalue=1 input.mp4)
+        BITRATE=$(ffprobe -v error -select_streams v:0 -show_entries stream=bit_rate -of default=noprint_wrappers=1:nokey=1:novalue=1 input.mp4)
+        
+        echo "Input Quality:"
+        echo "  Duration: $DURATION seconds"
+        echo "  Resolution: ${WIDTH}x${HEIGHT}"
+        echo "  Bitrate: $BITRATE bps"
+        
+        # Determine which qualities to generate
+        # If input is less than 360p, don't generate higher qualities
+        if [ "$HEIGHT" -lt 360 ]; then
+          echo "QUALITIES=144p" >> $GITHUB_OUTPUT
+        elif [ "$HEIGHT" -lt 480 ]; then
+          echo "QUALITIES=144p 360p" >> $GITHUB_OUTPUT
+        elif [ "$HEIGHT" -lt 720 ]; then
+          echo "QUALITIES=144p 360p 480p" >> $GITHUB_OUTPUT
+        elif [ "$HEIGHT" -lt 1080 ]; then
+          echo "QUALITIES=144p 360p 480p 720p" >> $GITHUB_OUTPUT
+        else
+          echo "QUALITIES=144p 360p 480p 720p 1080p" >> $GITHUB_OUTPUT
+        fi
+        
+        echo "Will generate: ${{ steps.detect.outputs.QUALITIES }}"
+    
+    # Step 6: Transcode to 144p
+    - name: Transcode to 144p
+      run: |
+        mkdir -p 144p
+        ffmpeg -i input.mp4 \
+          -c:v libx264 \
+          -s 256x144 \
+          -b:v 150k \
+          -c:a aac \
+          -b:a 32k \
+          -hls_time 6 \
+          -hls_list_size 0 \
+          -f hls \
+          144p/index.m3u8
+        echo "✓ 144p completed"
+    
+    # Step 7: Transcode to 360p
+    - name: Transcode to 360p
+      run: |
+        mkdir -p 360p
+        ffmpeg -i input.mp4 \
+          -c:v libx264 \
+          -s 640x360 \
+          -b:v 800k \
+          -c:a aac \
+          -b:a 96k \
+          -hls_time 6 \
+          -hls_list_size 0 \
+          -f hls \
+          360p/index.m3u8
+        echo "✓ 360p completed"
+    
+    # Step 8: Transcode to 480p
+    - name: Transcode to 480p
+      run: |
+        mkdir -p 480p
+        ffmpeg -i input.mp4 \
+          -c:v libx264 \
+          -s 842x480 \
+          -b:v 1200k \
+          -c:a aac \
+          -b:a 128k \
+          -hls_time 6 \
+          -hls_list_size 0 \
+          -f hls \
+          480p/index.m3u8
+        echo "✓ 480p completed"
+    
+    # Step 9: Transcode to 720p
+    - name: Transcode to 720p
+      run: |
+        mkdir -p 720p
+        ffmpeg -i input.mp4 \
+          -c:v libx264 \
+          -s 1280x720 \
+          -b:v 2500k \
+          -c:a aac \
+          -b:a 192k \
+          -hls_time 6 \
+          -hls_list_size 0 \
+          -f hls \
+          720p/index.m3u8
+        echo "✓ 720p completed"
+    
+    # Step 10: Transcode to 1080p (only if input supports)
+    - name: Transcode to 1080p
+      if: contains(steps.detect.outputs.QUALITIES, '1080p')
+      run: |
+        mkdir -p 1080p
+        ffmpeg -i input.mp4 \
+          -c:v libx264 \
+          -s 1920x1080 \
+          -b:v 5000k \
+          -c:a aac \
+          -b:a 256k \
+          -hls_time 6 \
+          -hls_list_size 0 \
+          -f hls \
+          1080p/index.m3u8
+        echo "✓ 1080p completed"
+    
+    # Step 11: Create master playlist
+    - name: Create master playlist
+      run: |
+        cat > master.m3u8 << 'EOF'
+        #EXTM3U
+        #EXT-X-VERSION:3
+        #EXT-X-STREAM-INF:BANDWIDTH=150000,RESOLUTION=256x144
+        144p/index.m3u8
+        #EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360
+        360p/index.m3u8
+        #EXT-X-STREAM-INF:BANDWIDTH=1200000,RESOLUTION=842x480
+        480p/index.m3u8
+        #EXT-X-STREAM-INF:BANDWIDTH=2500000,RESOLUTION=1280x720
+        720p/index.m3u8
+        #EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=1920x1080
+        1080p/index.m3u8
+        EOF
+        echo "✓ Master playlist created"
+    
+    # Step 12: Upload to S3
+    - name: Upload to S3
+      run: |
+        VIDEO_ID="${{ inputs.videoId }}"
+        BUCKET="${{ inputs.bucket }}"
+        
+        # Upload processed videos
+        aws s3 sync 144p s3://$BUCKET/processed/$VIDEO_ID/144p/
+        aws s3 sync 360p s3://$BUCKET/processed/$VIDEO_ID/360p/
+        aws s3 sync 480p s3://$BUCKET/processed/$VIDEO_ID/480p/
+        aws s3 sync 720p s3://$BUCKET/processed/$VIDEO_ID/720p/
+        aws s3 sync 1080p s3://$BUCKET/processed/$VIDEO_ID/1080p/ || true
+        
+        # Upload playlists
+        aws s3 cp master.m3u8 s3://$BUCKET/playlists/$VIDEO_ID/master.m3u8
+        aws s3 cp 144p/index.m3u8 s3://$BUCKET/playlists/$VIDEO_ID/144p.m3u8
+        aws s3 cp 360p/index.m3u8 s3://$BUCKET/playlists/$VIDEO_ID/360p.m3u8
+        aws s3 cp 480p/index.m3u8 s3://$BUCKET/playlists/$VIDEO_ID/480p.m3u8
+        aws s3 cp 720p/index.m3u8 s3://$BUCKET/playlists/$VIDEO_ID/720p.m3u8
+        aws s3 cp 1080p/index.m3u8 s3://$BUCKET/playlists/$VIDEO_ID/1080p.m3u8 || true
+        
+        echo "✓ All files uploaded to S3"
+    
+    # Step 13: Update DynamoDB
+    - name: Update DynamoDB
+      run: |
+        python3 << 'PYTHON_EOF'
+        import boto3
+        from datetime import datetime
+        
+        VIDEO_ID = "${{ inputs.videoId }}"
+        BUCKET = "${{ inputs.bucket }}"
+        
+        dynamodb = boto3.resource('dynamodb', region_name='us-east-1')
+        table = dynamodb.Table('video-uploads')
+        
+        table.update_item(
+            Key={'videoId': VIDEO_ID},
+            UpdateExpression='SET #status = :status, processingEnded = :time, outputPath = :path',
+            ExpressionAttributeNames={'#status': 'status'},
+            ExpressionAttributeValues={
+                ':status': 'completed',
+                ':time': datetime.utcnow().isoformat(),
+                ':path': f"https://cdn.example.com/{BUCKET}/playlists/{VIDEO_ID}/master.m3u8"
+            }
+        )
+        
+        print(f"✓ DynamoDB updated for {VIDEO_ID}")
+        PYTHON_EOF
+    
+    # Step 14: Cleanup
+    - name: Cleanup
+      if: always()
+      run: |
+        rm -rf input.mp4 144p 360p 480p 720p 1080p master.m3u8
+        echo "✓ Cleanup completed"
